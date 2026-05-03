@@ -1,0 +1,4 @@
+.env
+ranked.db
+dc_env/
+__pycache__/
