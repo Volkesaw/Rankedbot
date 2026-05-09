@@ -59,6 +59,11 @@ class SetType(enum.Enum):
     Bo3 = "Best of 3"
     Bo5 = "Best of 5"
 
+class MapType(enum.Enum):
+    Modern = "Modern"
+    Easter = "Easter"
+    Tsunami = "Tsunami"
+
 # ─── DIVISION SYSTEM ─────────────────────────────────────────────────────────
 
 DIVISIONS = ["F Team", "D Team", "C Team", "B Team", "A Team", "S Team"]
@@ -202,6 +207,13 @@ except:
 try:
     cursor.execute("ALTER TABLE matches ADD COLUMN winner_id_final INTEGER DEFAULT NULL")
     cursor.execute("ALTER TABLE matches ADD COLUMN lp_change INTEGER DEFAULT 0")
+    conn.commit()
+except:
+    pass
+
+try:
+    cursor.execute("ALTER TABLE matches ADD COLUMN map TEXT DEFAULT NULL")
+    cursor.execute("ALTER TABLE profiles ADD COLUMN preferred_map TEXT DEFAULT NULL")
     conn.commit()
 except:
     pass
@@ -373,11 +385,12 @@ active_matches = {}
 help_cooldowns = {}
 
 class QueueEntry:
-    def __init__(self, user_id, region, ability, set_type, elo, joined_at):
+    def __init__(self, user_id, region, ability, set_type, map_type, elo, joined_at):
         self.user_id = user_id
         self.region = region
         self.ability = ability
         self.set_type = set_type
+        self.map_type = map_type
         self.elo = elo
         self.joined_at = joined_at
 
@@ -431,7 +444,8 @@ async def queue(
     interaction: discord.Interaction,
     region: Region,
     ability: Ability,
-    set_type: SetType
+    set_type: SetType,
+    map_type: MapType = None
 ):
     if not is_queue_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
@@ -455,18 +469,30 @@ async def queue(
     player = get_player(user_id)
     elo = player[1]
 
+    if map_type is None:
+        cursor.execute("SELECT preferred_map FROM profiles WHERE user_id = ?", (user_id,))
+        pref = cursor.fetchone()
+        if pref and pref[0]:
+            try:
+                map_type = MapType(pref[0])
+            except:
+                map_type = random.choice(list(MapType))
+        else:
+            map_type = random.choice(list(MapType))
+
     entry = QueueEntry(
         user_id=user_id,
         region=region.value,
         ability=ability.value,
         set_type=set_type.value,
+        map_type=map_type.value,
         elo=elo,
         joined_at=datetime.utcnow()
     )
     active_queues[user_id] = entry
 
     await interaction.response.send_message(
-        f"You joined the queue!\nRegion: {region.value} | Ability: {ability.value} | Set Type: {set_type.value}",
+        f"You joined the queue!\nRegion: {region.value} | Ability: {ability.value} | Set Type: {set_type.value} | Map: {map_type.value}",
         ephemeral=True
     )
 
@@ -508,10 +534,17 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
                 chosen_set = random.choice([entry.set_type, other.set_type])
                 set_note = f"Set Type: {chosen_set} *(decided by coinflip)*"
 
+            if entry.map_type == other.map_type:
+                chosen_map = entry.map_type
+                map_note = f"Map: {chosen_map}"
+            else:
+                chosen_map = random.choice([entry.map_type, other.map_type])
+                map_note = f"Map: {chosen_map} *(decided by coinflip)*"
+
             active_queues.pop(entry.user_id, None)
             active_queues.pop(other_id, None)
 
-            await create_match_channel(guild, entry, other, chosen_set, set_note)
+            await create_match_channel(guild, entry, other, chosen_set, set_note, chosen_map, map_note)
             return
 
         await asyncio.sleep(10)
@@ -531,7 +564,7 @@ async def leavequeue(interaction: discord.Interaction):
 
 # ─── MATCH CHANNEL ───────────────────────────────────────────────────────────
 
-async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry, chosen_set: str, set_note: str):
+async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry, chosen_set: str, set_note: str, chosen_map: str, map_note: str):
     category = discord.utils.get(guild.categories, name=MATCH_CATEGORY_NAME)
     rover_role = discord.utils.get(guild.roles, name="RoVer Updater")
 
@@ -553,9 +586,9 @@ async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player
     )
 
     cursor.execute("""
-        INSERT INTO matches (player1_id, player2_id, channel_id, region, ability, set_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (player1.user_id, player2.user_id, channel.id, player1.region, player1.ability, chosen_set, str(datetime.utcnow())))
+        INSERT INTO matches (player1_id, player2_id, channel_id, region, ability, set_type, map, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (player1.user_id, player2.user_id, channel.id, player1.region, player1.ability, chosen_set, chosen_map, str(datetime.utcnow())))
     conn.commit()
 
     active_matches[channel.id] = {
@@ -588,6 +621,9 @@ async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player
     embed.add_field(name="Set Type", value=set_note, inline=False)
     embed.set_footer(text="When the match is over, the winner uses /reportwin • Use /help for disputes")
     embed.timestamp = datetime.utcnow()
+
+    embed.add_field(name="Set Type", value=set_note, inline=False)
+    embed.add_field(name="Map", value=map_note, inline=False)
 
     await channel.send(content=f"{member1.mention} {member2.mention}", embed=embed)
 
@@ -903,10 +939,11 @@ async def info(interaction: discord.Interaction, member: discord.Member = None):
     fav_set = cursor.fetchone()
     fav_set_str = fav_set[0] if fav_set else "N/A"
 
-    cursor.execute("SELECT preferred_region, preferred_ability FROM profiles WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT preferred_region, preferred_ability, preferred_map FROM profiles WHERE user_id = ?", (user_id,))
     prefs = cursor.fetchone()
     pref_region = prefs[0] if prefs and prefs[0] else "Not set"
     pref_ability = prefs[1] if prefs and prefs[1] else "Not set"
+    pref_map = prefs[2] if prefs and prefs[2] else "Not set"
 
     embed = discord.Embed(
         title=f"⚔️ {target.display_name}'s Profile",
@@ -920,10 +957,10 @@ async def info(interaction: discord.Interaction, member: discord.Member = None):
     embed.add_field(name="Bio", value=bio, inline=False)
     embed.add_field(name="Preferred Region", value=pref_region, inline=True)
     embed.add_field(name="Preferred Ability", value=pref_ability, inline=True)
+    embed.add_field(name="Preferred Map", value=pref_map, inline=True)
     embed.set_footer(text=f"OABD Ranked • Member since {joined_at}")
 
     await interaction.response.send_message(embed=embed)
-
 # ─── LEADERBOARD COMMAND ─────────────────────────────────────────────────────
 
 @bot.tree.command(name="leaderboard", description="See the top ranked players or players in your division")
@@ -1066,11 +1103,13 @@ async def queuestatus(interaction: discord.Interaction):
 
 # ─── SET PROFILE COMMAND ─────────────────────────────────────────────────────
 
-@bot.tree.command(name="setprofile", description="Set your preferred region, ability, and bio")
+@bot.tree.command(name="setprofile", description="Set your preferred region, ability, map, and bio")
 async def setprofile(
     interaction: discord.Interaction,
     region: Region = None,
     ability: Ability = None,
+    set_type: SetType = None,
+    map_type: MapType = None,
     bio: str = None
 ):
     if not is_queue_channel(interaction):
@@ -1081,18 +1120,23 @@ async def setprofile(
     joined_at = datetime.utcnow().strftime("%Y-%m-%d")
 
     cursor.execute("""
-        INSERT INTO profiles (user_id, display_name, bio, joined_at, preferred_region, preferred_ability)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO profiles (user_id, display_name, bio, joined_at, preferred_region, preferred_ability, preferred_map)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             display_name = ?,
             bio = COALESCE(?, bio),
             preferred_region = COALESCE(?, preferred_region),
-            preferred_ability = COALESCE(?, preferred_ability)
+            preferred_ability = COALESCE(?, preferred_ability),
+            preferred_map = COALESCE(?, preferred_map)
     """, (
         user_id, interaction.user.display_name, bio or "", joined_at,
-        region.value if region else None, ability.value if ability else None,
+        region.value if region else None,
+        ability.value if ability else None,
+        map_type.value if map_type else None,
         interaction.user.display_name, bio,
-        region.value if region else None, ability.value if ability else None
+        region.value if region else None,
+        ability.value if ability else None,
+        map_type.value if map_type else None
     ))
     conn.commit()
 
