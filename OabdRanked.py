@@ -24,19 +24,26 @@ SEASON_ADMINS = [
 MATCH_CATEGORY_NAME = "▬▬Ranked Bot▬▬"
 MATCH_CATEGORY_IDS = {1500274581901148301}  # main server's "Ranked Bot" category
 ALLOWED_CHANNEL_ID = 1500277677465272380
-ALLOWED_CHANNEL_NAMES = {"ratio"}
-INFO_CHANNEL_NAMES = {"💆‍♂️-bot-commands"}  # extra channels where read-only lookups (/rank, /leaderboard, /stats) are allowed
+ALLOWED_CHANNEL_NAMES = {"ratio", "queue-system"}
+INFO_CHANNEL_NAMES = {"bot-commands"}  # extra channels where read-only lookups (/rank, /leaderboard, /stats) are allowed
 LOG_CHANNEL_NAME = "ranked-logs"
 ANNOUNCEMENT_CHANNEL_NAME = "ranked-announcements"
 
 
+def _channel_name_matches(channel_name: str, allowed_names: set) -> bool:
+    # Substring match so emoji/decoration prefixes on the channel name
+    # (e.g. "💆‍♂️-bot-commands") don't break an otherwise-correct name.
+    lowered = channel_name.lower()
+    return any(name in lowered for name in allowed_names)
+
+
 def is_queue_channel(interaction: discord.Interaction) -> bool:
     channel = interaction.channel
-    return channel.id == ALLOWED_CHANNEL_ID or channel.name in ALLOWED_CHANNEL_NAMES
+    return channel.id == ALLOWED_CHANNEL_ID or _channel_name_matches(channel.name, ALLOWED_CHANNEL_NAMES)
 
 
 def is_info_channel(interaction: discord.Interaction) -> bool:
-    return is_queue_channel(interaction) or interaction.channel.name in INFO_CHANNEL_NAMES
+    return is_queue_channel(interaction) or _channel_name_matches(interaction.channel.name, INFO_CHANNEL_NAMES)
 
 
 def is_match_channel(interaction: discord.Interaction) -> bool:
@@ -97,24 +104,23 @@ class Region(enum.Enum):
     Asia = "AS"
 
 class Ability(enum.Enum):
-    SP_Soda = "SP Soda"; SPSO = "SPSO"; SPTW = "SPTW"; SPP = "SPP"
-    SPOH = "SPOH"; Classic_SP = "Classic SP"; Classic_TW = "Classic TW"
-    TW = "TW"; VTW = "VTW"; TWOH = "TWOH"; OSTW = "OSTW"; STW = "STW"
-    NSTW = "NSTW"; TW_S = "TW:S"; Vampire = "Vampire"; Pillarman = "Pillarman"
-    Kars = "Kars"; Stone_Free = "Stone Free"; Diver_Down = "Diver Down"
-    WS = "WS"; C_MOON = "C-MOON"; MIH = "MIH"; CMIH = "CMIH"; CD = "CD"
-    Classic_CD = "Classic CD"; The_Hand = "The Hand"; KQ = "KQ"; CKQ = "CKQ"
-    KQBTD = "KQBTD"; CKQBTD = "CKQBTD"; KC = "KC"; CKC = "CKC"
-    KCAU = "KCAU"; CKCAU = "CKCAU"; SAW = "SAW"; Spin = "Spin"
-    Hamon = "Hamon"; TA1 = "TA1"; TA2 = "TA2"; TA3 = "TA3"; TA4 = "TA4"
-    WR = "WR"; TWAU = "TWAU"; KQAU = "KQAU"; Sticky_Fingers = "Sticky Fingers"
-    Mr_President = "Mr President"; PSC = "PSC"; WSU = "WSU"
-    Steve_Platinum = "Steve Platinum"; OGER = "OGER"; GER = "GER"
-    Anubis = "Anubis"; SC = "SC"; HG = "HG"; Chaka = "Chaka"; D13 = "D13"
-    The_Emperor = "The Emperor"; Cream = "Cream"; GE = "GE"
-    Purple_Haze = "Purple Haze"; Doppio_1arm = "Doppio 1 arm"
-    Doppio_2arm = "Doppio 2 arm"; D4C = "D4C"; CD4C = "CD4C"
-    Deimos = "Deimos"
+    Anubis = "Anubis"; C_MOON = "C-MOON"; CD = "CD"; CD4C = "CD4C"
+    Chaka = "Chaka"; CKC = "CKC"; CKCAU = "CKCAU"; CKQ = "CKQ"
+    CKQBTD = "CKQBTD"; Classic_CD = "Classic CD"; Classic_SP = "Classic SP"
+    Classic_TW = "Classic TW"; CMIH = "CMIH"; Cream = "Cream"; D13 = "D13"
+    D4C = "D4C"; Deimos = "Deimos"; Diver_Down = "Diver Down"
+    Doppio_1arm = "Doppio 1 arm"; Doppio_2arm = "Doppio 2 arm"; GE = "GE"
+    GER = "GER"; Green_Day = "Green Day"; Hamon = "Hamon"; HG = "HG"
+    Kars = "Kars"; KC = "KC"; KCAU = "KCAU"; KQ = "KQ"; KQAU = "KQAU"
+    KQBTD = "KQBTD"; MIH = "MIH"; Mr_President = "Mr President"; NSTW = "NSTW"
+    OGER = "OGER"; OSTW = "OSTW"; Pillarman = "Pillarman"; PSC = "PSC"
+    Purple_Haze = "Purple Haze"; SAW = "SAW"; SC = "SC"; SP_Soda = "SP Soda"
+    Spin = "Spin"; SPOH = "SPOH"; SPP = "SPP"; SPSO = "SPSO"; SPTW = "SPTW"
+    Steve_Platinum = "Steve Platinum"; Sticky_Fingers = "Sticky Fingers"
+    Stone_Free = "Stone Free"; STW = "STW"; TA1 = "TA1"; TA2 = "TA2"
+    TA3 = "TA3"; TA4 = "TA4"; The_Emperor = "The Emperor"; The_Hand = "The Hand"
+    TW = "TW"; TW_S = "TW:S"; TWAU = "TWAU"; TWOH = "TWOH"; Vampire = "Vampire"
+    VTW = "VTW"; WR = "WR"; WS = "WS"; WSU = "WSU"
 
 class SetType(enum.Enum):
     Bo1 = "Best of 1"
@@ -974,16 +980,32 @@ async def setup_hook():
 bot.setup_hook = setup_hook
 
 # ─── QUEUE COMMANDS ───────────────────────────────────────────────────────────
+# Ability has 66 values, well past Discord's 25-choice cap for a fixed option
+# list, so it's offered via autocomplete (type-to-search) instead.
+
+ABILITY_VALUES = [a.value for a in Ability]
+
+async def ability_autocomplete(interaction: discord.Interaction, current: str):
+    current_lower = current.lower()
+    matches = [v for v in ABILITY_VALUES if current_lower in v.lower()]
+    return [app_commands.Choice(name=v, value=v) for v in matches[:25]]
 
 @bot.tree.command(name="queue", description="Queue up for a Ranked 1v1 match")
+@app_commands.autocomplete(ability=ability_autocomplete)
 async def queue(
     interaction: discord.Interaction,
     region: Region,
-    ability: Ability,
+    ability: str,
     set_type: SetType
 ):
     if not is_queue_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+
+    if ability not in ABILITY_VALUES:
+        await interaction.response.send_message(
+            f"'{ability}' isn't a valid ability — please pick one from the autocomplete list.", ephemeral=True
+        )
         return
 
     # Ack immediately so a slow first disk hit on ranked.db (e.g. a
@@ -1012,7 +1034,7 @@ async def queue(
     entry = QueueEntry(
         user_id=user_id,
         region=region.value,
-        ability=ability.value,
+        ability=ability,
         set_type=set_type.value,
         elo=elo,
         joined_at=datetime.utcnow()
@@ -1020,7 +1042,7 @@ async def queue(
     active_queues[user_id] = entry
 
     await interaction.followup.send(
-        f"You joined the queue!\nRegion: {region.value} | Ability: {ability.value} | Set Type: {set_type.value}",
+        f"You joined the queue!\nRegion: {region.value} | Ability: {ability} | Set Type: {set_type.value}",
         ephemeral=True
     )
 
@@ -1259,7 +1281,7 @@ async def stats(interaction: discord.Interaction):
 
 @bot.tree.command(name="info", description="View your full OABD Ranked profile")
 async def info(interaction: discord.Interaction, member: discord.Member = None):
-    if not is_queue_channel(interaction):
+    if not is_info_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
         return
 
@@ -1370,15 +1392,22 @@ async def history(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="setprofile", description="Set your preferred region, ability, set type, and bio")
+@app_commands.autocomplete(ability=ability_autocomplete)
 async def setprofile(
     interaction: discord.Interaction,
     region: Region = None,
-    ability: Ability = None,
+    ability: str = None,
     set_type: SetType = None,
     bio: str = None
 ):
     if not is_queue_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
+        return
+
+    if ability is not None and ability not in ABILITY_VALUES:
+        await interaction.response.send_message(
+            f"'{ability}' isn't a valid ability — please pick one from the autocomplete list.", ephemeral=True
+        )
         return
 
     user_id = interaction.user.id
@@ -1396,11 +1425,11 @@ async def setprofile(
     """, (
         user_id, interaction.user.display_name, bio or "", joined_at,
         region.value if region else None,
-        ability.value if ability else None,
+        ability if ability else None,
         set_type.value if set_type else None,
         interaction.user.display_name, bio,
         region.value if region else None,
-        ability.value if ability else None,
+        ability if ability else None,
         set_type.value if set_type else None
     ))
     conn.commit()
