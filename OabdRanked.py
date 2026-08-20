@@ -25,7 +25,7 @@ MATCH_CATEGORY_NAME = "▬▬Ranked Bot▬▬"
 MATCH_CATEGORY_IDS = {1500274581901148301}  # main server's "Ranked Bot" category
 ALLOWED_CHANNEL_ID = 1500277677465272380
 ALLOWED_CHANNEL_NAMES = {"ratio"}
-INFO_CHANNEL_NAMES = {"bot-commands"}  # extra channels where read-only lookups (/rank, /leaderboard, /stats) are allowed
+INFO_CHANNEL_NAMES = {"💆‍♂️-bot-commands"}  # extra channels where read-only lookups (/rank, /leaderboard, /stats) are allowed
 LOG_CHANNEL_NAME = "ranked-logs"
 ANNOUNCEMENT_CHANNEL_NAME = "ranked-announcements"
 
