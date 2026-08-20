@@ -22,8 +22,10 @@ SEASON_ADMINS = [
 ]
 
 MATCH_CATEGORY_NAME = "▬▬Ranked Bot▬▬"
+MATCH_CATEGORY_IDS = {1500274581901148301}  # main server's "Ranked Bot" category
 ALLOWED_CHANNEL_ID = 1500277677465272380
 ALLOWED_CHANNEL_NAMES = {"ratio"}
+INFO_CHANNEL_NAMES = {"bot-commands"}  # extra channels where read-only lookups (/rank, /leaderboard, /stats) are allowed
 LOG_CHANNEL_NAME = "ranked-logs"
 ANNOUNCEMENT_CHANNEL_NAME = "ranked-announcements"
 
@@ -33,10 +35,23 @@ def is_queue_channel(interaction: discord.Interaction) -> bool:
     return channel.id == ALLOWED_CHANNEL_ID or channel.name in ALLOWED_CHANNEL_NAMES
 
 
+def is_info_channel(interaction: discord.Interaction) -> bool:
+    return is_queue_channel(interaction) or interaction.channel.name in INFO_CHANNEL_NAMES
+
+
 def is_match_channel(interaction: discord.Interaction) -> bool:
-    if interaction.channel.category is None:
+    category = interaction.channel.category
+    if category is None:
         return False
-    return interaction.channel.category.name == MATCH_CATEGORY_NAME
+    return category.id in MATCH_CATEGORY_IDS or category.name == MATCH_CATEGORY_NAME
+
+
+def get_match_category(guild: discord.Guild):
+    for category_id in MATCH_CATEGORY_IDS:
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            return category
+    return discord.utils.get(guild.categories, name=MATCH_CATEGORY_NAME)
 
 
 DIVISIONS = ["F Team", "D Team", "C Team", "B Team", "A Team", "S Team"]
@@ -681,7 +696,7 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
         await asyncio.sleep(10)
 
 async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry, chosen_set: str, set_note: str):
-    category = discord.utils.get(guild.categories, name=MATCH_CATEGORY_NAME)
+    category = get_match_category(guild)
     rover_role = discord.utils.get(guild.roles, name="RoVer Updater")
 
     member1 = guild.get_member(player1.user_id)
@@ -1176,7 +1191,7 @@ async def help_command(interaction: discord.Interaction):
 
 @bot.tree.command(name="rank", description="Check your current rank and LP")
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
-    if not is_queue_channel(interaction):
+    if not is_info_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
         return
 
@@ -1223,7 +1238,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
 
 @bot.tree.command(name="stats", description="Check your win/loss record")
 async def stats(interaction: discord.Interaction):
-    if not is_queue_channel(interaction):
+    if not is_info_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
         return
 
@@ -1396,7 +1411,7 @@ async def setprofile(
 
 @bot.tree.command(name="leaderboard", description="See the top ranked players or players in your division")
 async def leaderboard(interaction: discord.Interaction, division: str = None):
-    if not is_queue_channel(interaction):
+    if not is_info_channel(interaction):
         await interaction.response.send_message("This command can only be used in the designated channel.", ephemeral=True)
         return
 
