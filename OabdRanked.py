@@ -66,17 +66,40 @@ TIERS = ["Low", "Mid", "High"]
 TIER_LP_WIDTH = 34  # splits each division's 0-99 LP into three display bands
 
 EX_TEAM_MAX = 10
-MAX_LP_GAIN = 30
+
+# EX Team / S Team-level LP: replaces the normal division-scaled formula
+# with a flat base plus small elo-difference and set-type swings.
+EX_TIER_ELO_THRESHOLD = 500  # S Team and above counts as this tier
+EX_TIER_BASE_LP = 30
+EX_TIER_UPSET_BONUS_MIN = 1   # smallest gain bonus for beating a higher-elo opponent
+EX_TIER_UPSET_BONUS_MAX = 3   # largest gain bonus for beating a much higher-elo opponent
+EX_TIER_LOSS_INCREASE_MIN = 2  # smallest extra loss, for losing to a much lower-elo opponent
+EX_TIER_LOSS_INCREASE_MAX = 5  # largest extra loss, for losing despite being equal/ahead on elo
+EX_TIER_ELO_SPAN = 100  # elo gap over which the bonus/penalty scales from min to max
 
 REGION_PRIORITY = {
-    "NA": ["NA", "EU", "AS"],
-    "EU": ["EU", "NA", "AS"],
-    "AS": ["AS", "EU", "NA"],
+    "NA": ["NA", "SA", "EU", "AS"],
+    "EU": ["EU", "NA", "AS", "SA"],
+    "AS": ["AS", "EU", "NA", "SA"],
+    "SA": ["SA", "NA", "EU", "AS"],
 }
 
 MATCH_TIMEOUT_MINUTES = 45
 BO5_TIMEOUT_BONUS_MINUTES = 15
 TIMEOUT_CLEANUP_DELAY_MINUTES = 5
+
+# Matchmaking elo spread, expressed in divisions (100 elo each) so it's easy
+# to retune. Lower divisions get a tighter spread; B Team and up (plus EX
+# Team) get a wider one since there are fewer players up there to match with.
+LOW_TIER_MATCH_RANGE_DIVISIONS = 1
+HIGH_TIER_MATCH_RANGE_DIVISIONS = 3
+HIGH_TIER_ELO_THRESHOLD = 300  # B Team and above
+
+
+def get_match_range_elo(elo: int, is_ex: bool) -> int:
+    if is_ex or elo >= HIGH_TIER_ELO_THRESHOLD:
+        return HIGH_TIER_MATCH_RANGE_DIVISIONS * 100
+    return LOW_TIER_MATCH_RANGE_DIVISIONS * 100
 
 
 def elo_to_division(elo: int):
@@ -100,6 +123,7 @@ def get_division_display(division: str, lp: int) -> str:
 
 class Region(enum.Enum):
     North_America = "NA"
+    South_America = "SA"
     Europe = "EU"
     Asia = "AS"
 
@@ -111,16 +135,17 @@ class Ability(enum.Enum):
     D4C = "D4C"; Deimos = "Deimos"; Diver_Down = "Diver Down"
     Doppio_1arm = "Doppio 1 arm"; Doppio_2arm = "Doppio 2 arm"; GE = "GE"
     GER = "GER"; Green_Day = "Green Day"; Hamon = "Hamon"; HG = "HG"
-    Kars = "Kars"; KC = "KC"; KCAU = "KCAU"; KQ = "KQ"; KQAU = "KQAU"
-    KQBTD = "KQBTD"; MIH = "MIH"; Mr_President = "Mr President"; NSTW = "NSTW"
-    OGER = "OGER"; OSTW = "OSTW"; Pillarman = "Pillarman"; PSC = "PSC"
-    Purple_Haze = "Purple Haze"; SAW = "SAW"; SC = "SC"; SP_Soda = "SP Soda"
-    Spin = "Spin"; SPOH = "SPOH"; SPP = "SPP"; SPSO = "SPSO"; SPTW = "SPTW"
-    Steve_Platinum = "Steve Platinum"; Sticky_Fingers = "Sticky Fingers"
-    Stone_Free = "Stone Free"; STW = "STW"; TA1 = "TA1"; TA2 = "TA2"
-    TA3 = "TA3"; TA4 = "TA4"; The_Emperor = "The Emperor"; The_Hand = "The Hand"
-    TW = "TW"; TW_S = "TW:S"; TWAU = "TWAU"; TWOH = "TWOH"; Vampire = "Vampire"
-    VTW = "VTW"; WR = "WR"; WS = "WS"; WSU = "WSU"
+    JHamon = "JHamon"; Kars = "Kars"; KC = "KC"; KCAU = "KCAU"; KQ = "KQ"
+    KQAU = "KQAU"; KQBTD = "KQBTD"; MIH = "MIH"; Mr_President = "Mr President"
+    NSTW = "NSTW"; OGER = "OGER"; OSTW = "OSTW"; Pillarman = "Pillarman"
+    PSC = "PSC"; Purple_Haze = "Purple Haze"; Samurai = "Samurai"; SAW = "SAW"
+    SC = "SC"; SP_Soda = "SP Soda"; Spin = "Spin"; SPOH = "SPOH"; SPP = "SPP"
+    SPSO = "SPSO"; SPTW = "SPTW"; Steve_Platinum = "Steve Platinum"
+    Sticky_Fingers = "Sticky Fingers"; Stone_Free = "Stone Free"; STW = "STW"
+    TA1 = "TA1"; TA2 = "TA2"; TA3 = "TA3"; TA4 = "TA4"
+    The_Emperor = "The Emperor"; The_Hand = "The Hand"; TW = "TW"
+    TW_S = "TW:S"; TWAU = "TWAU"; TWOH = "TWOH"; Vampire = "Vampire"
+    VTW = "VTW"; Wammuu = "Wammuu"; WR = "WR"; WS = "WS"; WSU = "WSU"
 
 class SetType(enum.Enum):
     Bo1 = "Best of 1"
@@ -320,15 +345,42 @@ def record_season_history(user_id: int, season_number: int, elo: int, wins: int,
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (user_id, season_number, elo, division, lp, wins, losses))
 
-def calculate_lp_change(winner_elo: int, loser_elo: int, winner_id: int = None):
-    base = 20
+SET_TYPE_BASE_LP_ADJUSTMENT = {
+    "Best of 1": -5,
+    "Best of 5": 5,
+}
+
+
+def calculate_lp_change(winner_elo: int, loser_elo: int, winner_id: int = None, set_type: str = None):
+    set_adjustment = SET_TYPE_BASE_LP_ADJUSTMENT.get(set_type, 0)
+
+    if winner_id and (is_ex_team(winner_id) or winner_elo >= EX_TIER_ELO_THRESHOLD):
+        elo_diff = loser_elo - winner_elo  # positive = won against a higher-elo opponent (an upset)
+
+        if elo_diff > 0:
+            upset_bonus = EX_TIER_UPSET_BONUS_MIN + round(
+                (EX_TIER_UPSET_BONUS_MAX - EX_TIER_UPSET_BONUS_MIN)
+                * min(elo_diff, EX_TIER_ELO_SPAN) / EX_TIER_ELO_SPAN
+            )
+        else:
+            upset_bonus = 0
+
+        loss_severity = max(0, -elo_diff)  # how far below the winner the loser was
+        loss_increase = EX_TIER_LOSS_INCREASE_MAX - round(
+            (EX_TIER_LOSS_INCREASE_MAX - EX_TIER_LOSS_INCREASE_MIN)
+            * min(loss_severity, EX_TIER_ELO_SPAN) / EX_TIER_ELO_SPAN
+        )
+
+        gain = EX_TIER_BASE_LP + set_adjustment + upset_bonus
+        loss = EX_TIER_BASE_LP + set_adjustment + loss_increase
+        return gain, loss
+
+    base = 20 + set_adjustment
     division_diff = (loser_elo // 100) - (winner_elo // 100)
     gain_bonus = max(0, division_diff * 5)
     gain = base + gain_bonus
     loss_bonus = max(0, -division_diff * 10)
     loss = base + loss_bonus
-    if winner_id and (is_ex_team(winner_id) or winner_elo >= 500):
-        gain = min(gain, MAX_LP_GAIN)
     return gain, loss
 
 def get_announced_rank(user_id: int):
@@ -659,14 +711,26 @@ async def check_rank_announcement(guild: discord.Guild, user_id: int, new_elo: i
 
 # ─── MATCHMAKING & MATCH RESOLUTION ──────────────────────────────────────────
 
+def get_allowed_regions(entry: QueueEntry) -> list:
+    # Prefer the player's own region, but skip straight past it (and any
+    # other empty region) if nobody else is currently queued there, instead
+    # of making them wait out a timer before widening the search.
+    priority = REGION_PRIORITY[entry.region]
+    for region in priority:
+        has_queued_player = any(
+            uid != entry.user_id and other.region == region
+            for uid, other in active_queues.items()
+        )
+        if has_queued_player:
+            return [region]
+    return priority
+
+
 async def find_match(guild: discord.Guild, entry: QueueEntry):
     while entry.user_id in active_queues:
         seconds_waiting = (datetime.utcnow() - entry.joined_at).total_seconds()
 
-        if seconds_waiting < 300:
-            allowed_regions = [entry.region]
-        else:
-            allowed_regions = REGION_PRIORITY[entry.region]
+        allowed_regions = get_allowed_regions(entry)
 
         for other_id, other in list(active_queues.items()):
             if other_id == entry.user_id:
@@ -676,12 +740,12 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
             if seconds_waiting < 30 and other.set_type != entry.set_type:
                 continue
 
-            if is_ex_team(entry.user_id) or is_ex_team(other.user_id):
-                if abs(entry.elo - other.elo) > 300:
-                    continue
-            else:
-                if abs(entry.elo - other.elo) > 200:
-                    continue
+            match_range = max(
+                get_match_range_elo(entry.elo, is_ex_team(entry.user_id)),
+                get_match_range_elo(other.elo, is_ex_team(other.user_id))
+            )
+            if abs(entry.elo - other.elo) > match_range:
+                continue
 
             if is_on_cooldown(entry.user_id, other.user_id) or is_on_cooldown(other.user_id, entry.user_id):
                 continue
@@ -807,7 +871,14 @@ async def resolve_match(interaction, channel_id, winner_id, loser_id):
     winner_placements = winner[2]
     winner_ranked = winner[4]
 
-    gain, loss = calculate_lp_change(winner_elo, loser_elo, winner_id)
+    cursor.execute(
+        "SELECT set_type FROM matches WHERE channel_id = ? ORDER BY match_id DESC LIMIT 1",
+        (channel_id,)
+    )
+    match_row = cursor.fetchone()
+    match_set_type = match_row[0] if match_row else None
+
+    gain, loss = calculate_lp_change(winner_elo, loser_elo, winner_id, match_set_type)
 
     new_winner_elo = min(winner_elo + gain, 599)
     current_division = loser_elo // 100
@@ -1710,6 +1781,44 @@ async def resetfarming(interaction: discord.Interaction):
     conn.commit()
 
     await interaction.response.send_message("✅ All anti-farming cooldowns have been reset.", ephemeral=True)
+
+@bot.tree.command(name="queuelist", description="RoVer Updater only: see exactly who is currently in queue")
+async def queuelist(interaction: discord.Interaction):
+    rover_role = discord.utils.get(interaction.guild.roles, name="RoVer Updater")
+    if rover_role not in interaction.user.roles:
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if not active_queues:
+        await interaction.response.send_message("No players currently in queue.", ephemeral=True)
+        return
+
+    now = datetime.utcnow()
+    lines = []
+    for entry in sorted(active_queues.values(), key=lambda e: e.joined_at):
+        member = interaction.guild.get_member(entry.user_id)
+        name = member.mention if member else f"User {entry.user_id}"
+
+        if is_ex_team(entry.user_id):
+            rank_str = "👑 EX Team"
+        else:
+            division, lp = elo_to_division(entry.elo)
+            rank_str = f"{get_division_display(division, lp)} {lp} LP"
+
+        waited = int((now - entry.joined_at).total_seconds())
+        minutes, seconds = divmod(waited, 60)
+
+        lines.append(
+            f"{name} — {rank_str}\n"
+            f"Region: {entry.region} | Ability: {entry.ability} | Set: {entry.set_type} | Waiting: {minutes}m {seconds}s"
+        )
+
+    embed = discord.Embed(title="📋 Players in Queue", color=discord.Color.blurple())
+    embed.description = "\n\n".join(lines)
+    embed.set_footer(text=f"OABD Ranked • {len(active_queues)} player(s) in queue")
+    embed.timestamp = now
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ─── UTILITY COMMANDS ─────────────────────────────────────────────────────────
 
