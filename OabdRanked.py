@@ -92,7 +92,6 @@ SET_TYPE_PRIORITY = {
     "Best of 3": ["Best of 3", "Best of 1"],
     "Best of 1": ["Best of 1"],
 }
-SET_TYPE_VALUE = {"Best of 1": 1, "Best of 3": 3, "Best of 5": 5}
 
 MATCH_TIMEOUT_MINUTES = 45
 BO5_TIMEOUT_BONUS_MINUTES = 15
@@ -164,6 +163,7 @@ class Ability(enum.Enum):
     The_Emperor = "The Emperor"; The_Hand = "The Hand"; TW = "TW"
     TW_S = "TW:S"; TWAU = "TWAU"; TWOH = "TWOH"; Vampire = "Vampire"
     VTW = "VTW"; Wammuu = "Wammuu"; WR = "WR"; WS = "WS"; WSU = "WSU"
+    Zhamon = "Zhamon"
 
 class SetType(enum.Enum):
     Bo1 = "Best of 1"
@@ -636,7 +636,7 @@ async def send_match_log(guild: discord.Guild, player1: QueueEntry, player2: Que
     embed.add_field(
         name="📋 Agreed Terms",
         value=(
-            f"**Set Type:** {chosen_set} {'✅ *(agreed)*' if set_agreed else '⬇️ *(lower of the two)*'}\n"
+            f"**Set Type:** {chosen_set} {'✅ *(agreed)*' if set_agreed else '🎲 *(coinflip)*'}\n"
             f"{host_region_note}"
         ),
         inline=False
@@ -747,10 +747,13 @@ async def maybe_ping_queue_role(guild: discord.Guild, entry: QueueEntry):
     match_range = get_match_range_elo(entry.elo, is_ex_team(entry.user_id))
     elo_min = max(0, entry.elo - match_range)
     elo_max = min(599, entry.elo + match_range)
+    min_div, min_lp = elo_to_division(elo_min)
+    max_div, max_lp = elo_to_division(elo_max)
+    rank_range = f"{get_division_display(min_div, min_lp)} to {get_division_display(max_div, max_lp)}"
 
     await status_channel.send(
         f"{role_mention} A player just joined the ranked queue!\n"
-        f"**Elo Range Available:** {elo_min}-{elo_max}\n"
+        f"**Rank Range Available:** {rank_range}\n"
         f"**Region:** {entry.region}"
     )
 
@@ -841,10 +844,13 @@ def get_allowed_set_types(entry: QueueEntry) -> list:
 def chunk_list(items: list, size: int) -> list:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
+def ability_range_label(abilities: list) -> str:
+    return f"{abilities[0][0].upper()}-{abilities[-1][0].upper()}"
+
 class AbilitySelect(discord.ui.Select):
     def __init__(self, abilities: list, row: int):
         options = [discord.SelectOption(label=a, value=a) for a in abilities]
-        super().__init__(placeholder=f"Ban: {abilities[0]} – {abilities[-1]}", min_values=1, max_values=1,
+        super().__init__(placeholder=f"Ban: {ability_range_label(abilities)}", min_values=1, max_values=1,
                           options=options, row=row)
 
     async def callback(self, interaction: discord.Interaction):
@@ -852,49 +858,30 @@ class AbilitySelect(discord.ui.Select):
         chosen = self.values[0]
         view.result_ban = chosen
         record_ability_banned(chosen)
-
-        if chosen == view.entry.ability:
-            remaining = [a for a in ABILITY_VALUES if a != chosen]
-            repick_view = RepickSelectView(view, remaining)
-            await interaction.response.edit_message(
-                content=f"⚠️ You banned your own ability (**{chosen}**)! Pick a new one below.",
-                embed=None, view=repick_view
-            )
-        else:
-            await interaction.response.edit_message(
-                content=f"✅ You banned **{chosen}**. Your ability for this match stays **{view.entry.ability}**.",
-                embed=None, view=None
-            )
-            view.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ You banned **{chosen}**. Your ability for this match stays **{view.entry.ability}** "
+                f"(unless it turns out to be banned by your opponent too — you'll get a chance to repick if so)."
+            ),
+            embed=None, view=None
+        )
+        view.stop()
 
 class RepickSelect(discord.ui.Select):
     def __init__(self, abilities: list, row: int):
         options = [discord.SelectOption(label=a, value=a) for a in abilities]
-        super().__init__(placeholder=f"Pick: {abilities[0]} – {abilities[-1]}", min_values=1, max_values=1,
+        super().__init__(placeholder=f"Pick: {ability_range_label(abilities)}", min_values=1, max_values=1,
                           options=options, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        parent = self.view.parent
+        view: RepickView = self.view
         chosen = self.values[0]
-        parent.result_ability = chosen
+        view.result_ability = chosen
         await interaction.response.edit_message(
-            content=f"✅ You banned **{parent.result_ban}** and will use **{chosen}** for this match.",
+            content=f"✅ You'll use **{chosen}** for this match.",
             embed=None, view=None
         )
-        parent.stop()
-
-class RepickSelectView(discord.ui.View):
-    def __init__(self, parent: "BanSelectView", abilities: list):
-        super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
-        self.parent = parent
-        for i, chunk in enumerate(chunk_list(abilities, 25)):
-            self.add_item(RepickSelect(chunk, row=i))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.parent.entry.user_id:
-            await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
-            return False
-        return True
+        view.stop()
 
 class BanSelectView(discord.ui.View):
     def __init__(self, entry: QueueEntry):
@@ -928,6 +915,49 @@ class BanSelectView(discord.ui.View):
         await interaction.response.edit_message(content="⚠️ You abandoned this match.", embed=None, view=None)
         self.stop()
 
+class RepickView(discord.ui.View):
+    def __init__(self, user_id: int, excluded: set):
+        super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
+        self.user_id = user_id
+        self.result_ability = None
+        self.abandoned = False
+
+        remaining = [a for a in ABILITY_VALUES if a not in excluded]
+        for i, chunk in enumerate(chunk_list(remaining, 25)):
+            self.add_item(RepickSelect(chunk, row=i))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Abandon Match", style=discord.ButtonStyle.grey, row=3)
+    async def abandon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.abandoned = True
+        await interaction.response.edit_message(content="⚠️ You abandoned this match.", embed=None, view=None)
+        self.stop()
+
+async def deliver_ban_ui(guild: discord.Guild, entry: QueueEntry, embed: discord.Embed, view: discord.ui.View):
+    """Tries editing the original /queue response, then DMing. Returns (delivered, delivered_via_dm)."""
+    member = guild.get_member(entry.user_id)
+
+    if entry.interaction is not None:
+        try:
+            await entry.interaction.edit_original_response(content=None, embed=embed, view=view)
+            return True, False
+        except Exception:
+            pass
+
+    if member is not None:
+        try:
+            await member.send(embed=embed, view=view)
+            return True, True
+        except Exception:
+            pass
+
+    return False, False
+
 async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str) -> BanSelectView:
     view = BanSelectView(entry)
     member = guild.get_member(entry.user_id)
@@ -941,23 +971,7 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
         color=discord.Color.orange()
     )
 
-    delivered = False
-    delivered_via_dm = False
-
-    if entry.interaction is not None:
-        try:
-            await entry.interaction.edit_original_response(content=None, embed=embed, view=view)
-            delivered = True
-        except Exception:
-            delivered = False
-
-    if not delivered and member is not None:
-        try:
-            await member.send(embed=embed, view=view)
-            delivered = True
-            delivered_via_dm = True
-        except Exception:
-            delivered = False
+    delivered, delivered_via_dm = await deliver_ban_ui(guild, entry, embed, view)
 
     if not delivered:
         general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
@@ -995,6 +1009,52 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
 
     return view
 
+async def run_forced_repick_for_player(guild: discord.Guild, entry: QueueEntry, excluded: set) -> RepickView:
+    view = RepickView(entry.user_id, excluded)
+    member = guild.get_member(entry.user_id)
+
+    embed = discord.Embed(
+        title="⚠️ Your Ability Was Banned",
+        description=(
+            f"Your ability got banned during the ban phase (by you or your opponent). Pick a new one below. "
+            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
+        ),
+        color=discord.Color.red()
+    )
+
+    delivered, _ = await deliver_ban_ui(guild, entry, embed, view)
+
+    if not delivered:
+        general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
+        remaining = [a for a in ABILITY_VALUES if a not in excluded]
+        fallback_ability = random.choice(remaining) if remaining else entry.ability
+        if general_channel and member:
+            await general_channel.send(
+                f"{member.mention} ⚠️ Your ability was banned and we couldn't reach you to repick "
+                f"(check that you allow DMs from server members). We picked **{fallback_ability}** for you this time."
+            )
+        view.result_ability = fallback_ability
+        view.stop()
+        return view
+
+    await view.wait()
+    return view
+
+async def notify_both_abandoned(guild: discord.Guild, entry: QueueEntry, other: QueueEntry):
+    member1 = guild.get_member(entry.user_id)
+    member2 = guild.get_member(other.user_id)
+    for member in (member1, member2):
+        if member:
+            try:
+                await member.send("⚙️ Your match was abandoned during the ban phase. No LP changes.")
+            except Exception:
+                pass
+
+async def maybe_repick(needs_repick: bool, guild: discord.Guild, entry: QueueEntry, excluded: set):
+    if not needs_repick:
+        return None
+    return await run_forced_repick_for_player(guild, entry, excluded)
+
 async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry, other: QueueEntry,
                                           chosen_set: str, set_note: str):
     view1, view2 = await asyncio.gather(
@@ -1003,18 +1063,34 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
     )
 
     if view1.abandoned or view2.abandoned:
-        member1 = guild.get_member(entry.user_id)
-        member2 = guild.get_member(other.user_id)
-        for member in (member1, member2):
-            if member:
-                try:
-                    await member.send("⚙️ Your match was abandoned during the ban phase. No LP changes.")
-                except Exception:
-                    pass
+        await notify_both_abandoned(guild, entry, other)
         return
 
-    entry.ability = view1.result_ability
-    other.ability = view2.result_ability
+    # Bans affect both players, not just whoever banned it -- check each
+    # player's final ability against *both* bans (covers self-ban and
+    # opponent-ban with the same check).
+    excluded = {b for b in (view1.result_ban, view2.result_ban) if b}
+    final_ability1 = view1.result_ability
+    final_ability2 = view2.result_ability
+    needs_repick1 = final_ability1 in excluded
+    needs_repick2 = final_ability2 in excluded
+
+    repick1, repick2 = await asyncio.gather(
+        maybe_repick(needs_repick1, guild, entry, excluded),
+        maybe_repick(needs_repick2, guild, other, excluded)
+    )
+
+    if (needs_repick1 and repick1.abandoned) or (needs_repick2 and repick2.abandoned):
+        await notify_both_abandoned(guild, entry, other)
+        return
+
+    if needs_repick1:
+        final_ability1 = repick1.result_ability
+    if needs_repick2:
+        final_ability2 = repick2.result_ability
+
+    entry.ability = final_ability1
+    other.ability = final_ability2
 
     await create_match_channel(guild, entry, other, chosen_set, set_note, view1.result_ban, view2.result_ban)
 
@@ -1046,8 +1122,8 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
                 chosen_set = entry.set_type
                 set_note = f"Set Type: {chosen_set}"
             else:
-                chosen_set = min(entry.set_type, other.set_type, key=lambda s: SET_TYPE_VALUE[s])
-                set_note = f"Set Type: {chosen_set} *(lower of {entry.set_type} vs {other.set_type})*"
+                chosen_set = random.choice([entry.set_type, other.set_type])
+                set_note = f"Set Type: {chosen_set} *(decided by coinflip)*"
 
             active_queues.pop(entry.user_id, None)
             active_queues.pop(other_id, None)
