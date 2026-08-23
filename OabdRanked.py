@@ -749,7 +749,10 @@ async def maybe_ping_queue_role(guild: discord.Guild, entry: QueueEntry):
     elo_max = min(599, entry.elo + match_range)
     min_div, min_lp = elo_to_division(elo_min)
     max_div, max_lp = elo_to_division(elo_max)
-    rank_range = f"{get_division_display(min_div, min_lp)} to {get_division_display(max_div, max_lp)}"
+    rank_range = (
+        f"{get_division_display(min_div, min_lp)} ({min_lp} LP) to "
+        f"{get_division_display(max_div, max_lp)} ({max_lp} LP)"
+    )
 
     await status_channel.send(
         f"{role_mention} A player just joined the ranked queue!\n"
@@ -916,11 +919,12 @@ class BanSelectView(discord.ui.View):
         self.stop()
 
 class RepickView(discord.ui.View):
+    # No "Abandon Match" here on purpose -- abandoning only makes sense during
+    # the initial ban phase, not after a forced repick.
     def __init__(self, user_id: int, excluded: set):
         super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
         self.user_id = user_id
         self.result_ability = None
-        self.abandoned = False
 
         remaining = [a for a in ABILITY_VALUES if a not in excluded]
         for i, chunk in enumerate(chunk_list(remaining, 25)):
@@ -931,12 +935,6 @@ class RepickView(discord.ui.View):
             await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
             return False
         return True
-
-    @discord.ui.button(label="Abandon Match", style=discord.ButtonStyle.grey, row=3)
-    async def abandon(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.abandoned = True
-        await interaction.response.edit_message(content="⚠️ You abandoned this match.", embed=None, view=None)
-        self.stop()
 
 async def deliver_ban_ui(guild: discord.Guild, entry: QueueEntry, embed: discord.Embed, view: discord.ui.View):
     """Tries editing the original /queue response, then DMing. Returns (delivered, delivered_via_dm)."""
@@ -958,9 +956,19 @@ async def deliver_ban_ui(guild: discord.Guild, entry: QueueEntry, embed: discord
 
     return False, False
 
-async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str) -> BanSelectView:
+async def send_general_fallback(guild: discord.Guild, member, text: str):
+    general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
+    if not general_channel or not member:
+        return None
+    try:
+        return await general_channel.send(text)
+    except Exception:
+        return None
+
+async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str):
     view = BanSelectView(entry)
     member = guild.get_member(entry.user_id)
+    warning_message = None
 
     embed = discord.Embed(
         title="⚔️ Match Found — Ban Phase",
@@ -974,26 +982,37 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
     delivered, delivered_via_dm = await deliver_ban_ui(guild, entry, embed, view)
 
     if not delivered:
-        general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
-        if general_channel and member:
-            await general_channel.send(
-                f"{member.mention} ⚠️ We couldn't reach you to run your ban phase (check that you allow "
-                f"DMs from server members). It was skipped this time — your ability stays **{entry.ability}**."
-            )
+        warning_message = await send_general_fallback(
+            guild, member,
+            f"{member.mention if member else ''} ⚠️ We couldn't reach you to run your ban phase (check that you "
+            f"allow DMs from server members). It was skipped this time — your ability stays **{entry.ability}**."
+        )
         view.stop()
-        return view
+        return view, warning_message
 
     # Editing the original /queue response doesn't generate a notification for
     # them, so send a heads-up DM. Skipped if we already just DMed the ban UI
-    # itself, since that DM is its own notification.
+    # itself, since that DM is its own notification. If even this DM fails
+    # (e.g. DMs closed), fall back to a public ping so they're not left with
+    # zero indication anything happened.
     if not delivered_via_dm and member is not None:
+        notified = False
         try:
             await member.send(
                 f"⚔️ Your match's ban phase has started — check your original `/queue` response! "
                 f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
             )
+            notified = True
         except Exception:
-            pass
+            notified = False
+
+        if not notified:
+            warning_message = await send_general_fallback(
+                guild, member,
+                f"{member.mention} ⚔️ Your match's ban phase has started — check your original `/queue` "
+                f"response! (We couldn't DM you a heads-up — please allow DMs from server members so we can "
+                f"reach you with reminders.)"
+            )
 
     async def reminder():
         await asyncio.sleep(max(0, BAN_PHASE_TIMEOUT_MINUTES * 60 - BAN_PHASE_REMINDER_SECONDS_BEFORE_END))
@@ -1007,11 +1026,12 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
     await view.wait()
     reminder_task.cancel()
 
-    return view
+    return view, warning_message
 
-async def run_forced_repick_for_player(guild: discord.Guild, entry: QueueEntry, excluded: set) -> RepickView:
+async def run_forced_repick_for_player(guild: discord.Guild, entry: QueueEntry, excluded: set):
     view = RepickView(entry.user_id, excluded)
     member = guild.get_member(entry.user_id)
+    warning_message = None
 
     embed = discord.Embed(
         title="⚠️ Your Ability Was Banned",
@@ -1022,23 +1042,43 @@ async def run_forced_repick_for_player(guild: discord.Guild, entry: QueueEntry, 
         color=discord.Color.red()
     )
 
-    delivered, _ = await deliver_ban_ui(guild, entry, embed, view)
+    delivered, delivered_via_dm = await deliver_ban_ui(guild, entry, embed, view)
 
     if not delivered:
-        general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
         remaining = [a for a in ABILITY_VALUES if a not in excluded]
         fallback_ability = random.choice(remaining) if remaining else entry.ability
-        if general_channel and member:
-            await general_channel.send(
-                f"{member.mention} ⚠️ Your ability was banned and we couldn't reach you to repick "
-                f"(check that you allow DMs from server members). We picked **{fallback_ability}** for you this time."
-            )
+        warning_message = await send_general_fallback(
+            guild, member,
+            f"{member.mention if member else ''} ⚠️ Your ability was banned and we couldn't reach you to "
+            f"repick (check that you allow DMs from server members). We picked **{fallback_ability}** for you this time."
+        )
         view.result_ability = fallback_ability
         view.stop()
-        return view
+        return view, warning_message
+
+    # Same as the initial ban phase: guarantee a DM specifically saying their
+    # ability was banned, since editing the original response is silent. If
+    # even this DM fails, fall back to a public ping.
+    if not delivered_via_dm and member is not None:
+        notified = False
+        try:
+            await member.send(
+                f"⚠️ Your ability was banned during the ban phase! Check your original `/queue` response "
+                f"to pick a new one. You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
+            )
+            notified = True
+        except Exception:
+            notified = False
+
+        if not notified:
+            warning_message = await send_general_fallback(
+                guild, member,
+                f"{member.mention} ⚠️ Your ability was banned during the ban phase — check your original "
+                f"`/queue` response to pick a new one! (We couldn't DM you — please allow DMs from server members.)"
+            )
 
     await view.wait()
-    return view
+    return view, warning_message
 
 async def notify_both_abandoned(guild: discord.Guild, entry: QueueEntry, other: QueueEntry):
     member1 = guild.get_member(entry.user_id)
@@ -1050,20 +1090,31 @@ async def notify_both_abandoned(guild: discord.Guild, entry: QueueEntry, other: 
             except Exception:
                 pass
 
+async def delete_warning_messages(messages: list):
+    for msg in messages:
+        if msg is None:
+            continue
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
 async def maybe_repick(needs_repick: bool, guild: discord.Guild, entry: QueueEntry, excluded: set):
     if not needs_repick:
-        return None
+        return None, None
     return await run_forced_repick_for_player(guild, entry, excluded)
 
 async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry, other: QueueEntry,
                                           chosen_set: str, set_note: str):
-    view1, view2 = await asyncio.gather(
+    (view1, warn1), (view2, warn2) = await asyncio.gather(
         run_ban_phase_for_player(guild, entry, other.ability),
         run_ban_phase_for_player(guild, other, entry.ability)
     )
+    warning_messages = [warn1, warn2]
 
     if view1.abandoned or view2.abandoned:
         await notify_both_abandoned(guild, entry, other)
+        await delete_warning_messages(warning_messages)
         return
 
     # Bans affect both players, not just whoever banned it -- check each
@@ -1075,14 +1126,11 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
     needs_repick1 = final_ability1 in excluded
     needs_repick2 = final_ability2 in excluded
 
-    repick1, repick2 = await asyncio.gather(
+    (repick1, rwarn1), (repick2, rwarn2) = await asyncio.gather(
         maybe_repick(needs_repick1, guild, entry, excluded),
         maybe_repick(needs_repick2, guild, other, excluded)
     )
-
-    if (needs_repick1 and repick1.abandoned) or (needs_repick2 and repick2.abandoned):
-        await notify_both_abandoned(guild, entry, other)
-        return
+    warning_messages.extend([rwarn1, rwarn2])
 
     if needs_repick1:
         final_ability1 = repick1.result_ability
@@ -1093,6 +1141,7 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
     other.ability = final_ability2
 
     await create_match_channel(guild, entry, other, chosen_set, set_note, view1.result_ban, view2.result_ban)
+    await delete_warning_messages(warning_messages)
 
 
 async def find_match(guild: discord.Guild, entry: QueueEntry):
