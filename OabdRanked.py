@@ -84,9 +84,27 @@ REGION_PRIORITY = {
     "SA": ["SA", "NA", "EU", "AS"],
 }
 
+# Same live-population-cascade idea as REGION_PRIORITY, but descending only —
+# there's nothing below Bo1 to fall back to. Plain strings (not SetType.value)
+# since SetType isn't defined until the ENUMS section below this one.
+SET_TYPE_PRIORITY = {
+    "Best of 5": ["Best of 5", "Best of 3", "Best of 1"],
+    "Best of 3": ["Best of 3", "Best of 1"],
+    "Best of 1": ["Best of 1"],
+}
+SET_TYPE_VALUE = {"Best of 1": 1, "Best of 3": 3, "Best of 5": 5}
+
 MATCH_TIMEOUT_MINUTES = 45
 BO5_TIMEOUT_BONUS_MINUTES = 15
 TIMEOUT_CLEANUP_DELAY_MINUTES = 5
+
+QUEUE_PING_ROLE_NAME = "Ranked Queue"
+QUEUE_STATUS_CHANNEL_NAME = "ranked-status"
+QUEUE_PING_COOLDOWN_MINUTES = 30
+
+RANKED_GENERAL_CHANNEL_NAME = "ranked-general"
+BAN_PHASE_TIMEOUT_MINUTES = 2
+BAN_PHASE_REMINDER_SECONDS_BEFORE_END = 30
 
 # Matchmaking elo spread, expressed in divisions (100 elo each) so it's easy
 # to retune. Lower divisions get a tighter spread; B Team and up (plus EX
@@ -245,6 +263,16 @@ cursor.execute("""
     )
 """)
 
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ability_stats (
+        ability TEXT PRIMARY KEY,
+        times_used INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        times_banned INTEGER DEFAULT 0
+    )
+""")
+
 try:
     cursor.execute("ALTER TABLE players ADD COLUMN season_number INTEGER DEFAULT 1")
     conn.commit()
@@ -286,6 +314,13 @@ except:
 
 try:
     cursor.execute("ALTER TABLE players ADD COLUMN announced_rank TEXT DEFAULT NULL")
+    conn.commit()
+except:
+    pass
+
+try:
+    cursor.execute("ALTER TABLE matches ADD COLUMN player2_ability TEXT DEFAULT NULL")
+    cursor.execute("ALTER TABLE matches ADD COLUMN player2_region TEXT DEFAULT NULL")
     conn.commit()
 except:
     pass
@@ -390,6 +425,28 @@ def get_announced_rank(user_id: int):
 
 def set_announced_rank(user_id: int, division: str):
     cursor.execute("UPDATE players SET announced_rank = ? WHERE user_id = ?", (division, user_id))
+    conn.commit()
+
+def record_ability_used(ability: str):
+    cursor.execute("""
+        INSERT INTO ability_stats (ability, times_used) VALUES (?, 1)
+        ON CONFLICT(ability) DO UPDATE SET times_used = times_used + 1
+    """, (ability,))
+    conn.commit()
+
+def record_ability_result(ability: str, won: bool):
+    column = "wins" if won else "losses"
+    cursor.execute(f"""
+        INSERT INTO ability_stats (ability, {column}) VALUES (?, 1)
+        ON CONFLICT(ability) DO UPDATE SET {column} = {column} + 1
+    """, (ability,))
+    conn.commit()
+
+def record_ability_banned(ability: str):
+    cursor.execute("""
+        INSERT INTO ability_stats (ability, times_banned) VALUES (?, 1)
+        ON CONFLICT(ability) DO UPDATE SET times_banned = times_banned + 1
+    """, (ability,))
     conn.commit()
 
 def get_match_timeout_minutes(set_type: str) -> int:
@@ -512,15 +569,17 @@ def record_match_against(user_id: int, opponent_id: int):
 active_queues = {}
 active_matches = {}
 help_cooldowns = {}
+last_queue_ping_at = None
 
 class QueueEntry:
-    def __init__(self, user_id, region, ability, set_type, elo, joined_at):
+    def __init__(self, user_id, region, ability, set_type, elo, joined_at, interaction=None):
         self.user_id = user_id
         self.region = region
         self.ability = ability
         self.set_type = set_type
         self.elo = elo
         self.joined_at = joined_at
+        self.interaction = interaction  # original /queue interaction, used to try editing it for the ban phase
 
 # ─── LOGGING FUNCTIONS ───────────────────────────────────────────────────────
 # Posts/updates the match embed in #ranked-logs and posts promotion/demotion
@@ -528,7 +587,7 @@ class QueueEntry:
 # on the matches row so they survive a bot restart.
 
 async def send_match_log(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry,
-                          chosen_set: str, set_note: str,
+                          chosen_set: str, set_note: str, host_region_note: str,
                           match_channel: discord.TextChannel, match_id: int):
     log_channel = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
     if not log_channel:
@@ -542,7 +601,7 @@ async def send_match_log(guild: discord.Guild, player1: QueueEntry, player2: Que
     p1_rank = "👑 EX Team" if is_ex_team(player1.user_id) else f"{get_division_display(div1, lp1)} {lp1} LP"
     p2_rank = "👑 EX Team" if is_ex_team(player2.user_id) else f"{get_division_display(div2, lp2)} {lp2} LP"
 
-    set_coinflip = "coinflip" in set_note
+    set_agreed = player1.set_type == player2.set_type
 
     embed = discord.Embed(
         title=f"🎮 Match #{match_id} — In Progress",
@@ -576,7 +635,10 @@ async def send_match_log(guild: discord.Guild, player1: QueueEntry, player2: Que
 
     embed.add_field(
         name="📋 Agreed Terms",
-        value=f"**Set Type:** {chosen_set} {'🎲 *(coinflip)*' if set_coinflip else '✅ *(agreed)*'}",
+        value=(
+            f"**Set Type:** {chosen_set} {'✅ *(agreed)*' if set_agreed else '⬇️ *(lower of the two)*'}\n"
+            f"{host_region_note}"
+        ),
         inline=False
     )
 
@@ -668,6 +730,30 @@ async def update_match_log(guild: discord.Guild, channel_id: int, winner_member,
 
     await log_msg.edit(embed=new_embed)
 
+async def maybe_ping_queue_role(guild: discord.Guild, entry: QueueEntry):
+    global last_queue_ping_at
+    now = datetime.utcnow()
+    if last_queue_ping_at and (now - last_queue_ping_at).total_seconds() < QUEUE_PING_COOLDOWN_MINUTES * 60:
+        return
+    last_queue_ping_at = now
+
+    status_channel = discord.utils.get(guild.text_channels, name=QUEUE_STATUS_CHANNEL_NAME)
+    if not status_channel:
+        return
+
+    ping_role = discord.utils.get(guild.roles, name=QUEUE_PING_ROLE_NAME)
+    role_mention = ping_role.mention if ping_role else f"**{QUEUE_PING_ROLE_NAME}**"
+
+    match_range = get_match_range_elo(entry.elo, is_ex_team(entry.user_id))
+    elo_min = max(0, entry.elo - match_range)
+    elo_max = min(599, entry.elo + match_range)
+
+    await status_channel.send(
+        f"{role_mention} A player just joined the ranked queue!\n"
+        f"**Elo Range Available:** {elo_min}-{elo_max}\n"
+        f"**Region:** {entry.region}"
+    )
+
 async def check_rank_announcement(guild: discord.Guild, user_id: int, new_elo: int):
     if is_ex_team(user_id):
         return
@@ -726,18 +812,206 @@ def get_allowed_regions(entry: QueueEntry) -> list:
     return priority
 
 
+def get_allowed_set_types(entry: QueueEntry) -> list:
+    # Same idea as get_allowed_regions: prefer the player's own set type,
+    # cascading down toward lower Bo-counts if nobody else has it queued.
+    priority = SET_TYPE_PRIORITY[entry.set_type]
+    for set_type in priority:
+        has_queued_player = any(
+            uid != entry.user_id and other.set_type == set_type
+            for uid, other in active_queues.items()
+        )
+        if has_queued_player:
+            return [set_type]
+    return priority
+
+
+# ─── BAN PHASE ────────────────────────────────────────────────────────────────
+# Runs privately per-player once a match is found and before the match
+# channel exists. Each player may ban one ability from their own pool (which
+# forces a repick if they ban the ability they're currently using), or do
+# nothing, or abandon the match outright. Delivery tries, in order: editing
+# their original /queue response, DMing them, then a public fallback ping in
+# #ranked-general if neither reaches them.
+
+class RepickModal(discord.ui.Modal, title="Pick a New Ability"):
+    new_ability = discord.ui.TextInput(label="Your new ability (you banned your old one)", required=True)
+
+    def __init__(self, state: "BanPickView"):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction):
+        resolved = resolve_ability_input(self.new_ability.value)
+        if resolved is None:
+            await interaction.response.send_message(f"'{self.new_ability.value}' isn't a valid ability. Try again.", ephemeral=True)
+            return
+        if resolved == self.state.result_ban:
+            await interaction.response.send_message("You can't pick the ability you just banned.", ephemeral=True)
+            return
+
+        self.state.result_ability = resolved
+        await interaction.response.edit_message(
+            content=f"✅ You banned **{self.state.result_ban}** and will use **{resolved}** for this match.",
+            embed=None, view=None
+        )
+        self.state.stop()
+
+class BanModal(discord.ui.Modal, title="Ban an Ability"):
+    ability_to_ban = discord.ui.TextInput(label="Ability to ban (exact name)", required=True)
+
+    def __init__(self, state: "BanPickView"):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction):
+        resolved = resolve_ability_input(self.ability_to_ban.value)
+        if resolved is None:
+            await interaction.response.send_message(f"'{self.ability_to_ban.value}' isn't a valid ability. Try again.", ephemeral=True)
+            return
+
+        self.state.result_ban = resolved
+        record_ability_banned(resolved)
+
+        if resolved == self.state.entry.ability:
+            # They banned the ability they're currently set to use -- they need to pick a new one.
+            await interaction.response.send_modal(RepickModal(self.state))
+        else:
+            await interaction.response.edit_message(
+                content=f"✅ You banned **{resolved}**. Your ability for this match stays **{self.state.entry.ability}**.",
+                embed=None, view=None
+            )
+            self.state.stop()
+
+class BanPickView(discord.ui.View):
+    def __init__(self, entry: QueueEntry):
+        super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
+        self.entry = entry
+        self.result_ban = None
+        self.result_ability = entry.ability
+        self.abandoned = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.entry.user_id:
+            await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Ban an Ability", style=discord.ButtonStyle.danger)
+    async def ban_ability(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BanModal(self))
+
+    @discord.ui.button(label="Don't Ban Anything", style=discord.ButtonStyle.secondary)
+    async def no_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result_ban = None
+        await interaction.response.edit_message(
+            content=f"✅ You chose not to ban anything. Your ability stays **{self.entry.ability}**.",
+            embed=None, view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Abandon Match", style=discord.ButtonStyle.grey)
+    async def abandon(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.abandoned = True
+        await interaction.response.edit_message(content="⚠️ You abandoned this match.", embed=None, view=None)
+        self.stop()
+
+async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str) -> BanPickView:
+    view = BanPickView(entry)
+    member = guild.get_member(entry.user_id)
+
+    embed = discord.Embed(
+        title="⚔️ Match Found — Ban Phase",
+        description=(
+            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes to optionally ban one ability from the pool, "
+            f"or do nothing to keep your current pick.\n\n**Your current ability:** {entry.ability}"
+        ),
+        color=discord.Color.orange()
+    )
+
+    delivered = False
+    delivery_note = None
+
+    if entry.interaction is not None:
+        try:
+            await entry.interaction.edit_original_response(content=None, embed=embed, view=view)
+            delivered = True
+            delivery_note = "your original /queue response"
+        except Exception:
+            delivered = False
+
+    if not delivered and member is not None:
+        try:
+            await member.send(embed=embed, view=view)
+            delivered = True
+            delivery_note = "the DM we just sent you"
+        except Exception:
+            delivered = False
+
+    status_channel = discord.utils.get(guild.text_channels, name=QUEUE_STATUS_CHANNEL_NAME)
+    general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
+
+    if not delivered:
+        if general_channel and member:
+            await general_channel.send(
+                f"{member.mention} ⚠️ We couldn't reach you to run your ban phase (check that you allow "
+                f"DMs from server members). It was skipped this time — your ability stays **{entry.ability}**."
+            )
+        view.stop()
+        return view
+
+    if status_channel and member:
+        await status_channel.send(
+            f"{member.mention} ⚔️ Your match's ban phase has started — check {delivery_note}! "
+            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
+        )
+
+    async def reminder():
+        await asyncio.sleep(max(0, BAN_PHASE_TIMEOUT_MINUTES * 60 - BAN_PHASE_REMINDER_SECONDS_BEFORE_END))
+        if not view.is_finished() and status_channel and member:
+            await status_channel.send(
+                f"{member.mention} ⏰ {BAN_PHASE_REMINDER_SECONDS_BEFORE_END} seconds left in your ban phase!"
+            )
+
+    reminder_task = asyncio.create_task(reminder())
+    await view.wait()
+    reminder_task.cancel()
+
+    return view
+
+async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry, other: QueueEntry,
+                                          chosen_set: str, set_note: str):
+    view1, view2 = await asyncio.gather(
+        run_ban_phase_for_player(guild, entry, other.ability),
+        run_ban_phase_for_player(guild, other, entry.ability)
+    )
+
+    if view1.abandoned or view2.abandoned:
+        status_channel = discord.utils.get(guild.text_channels, name=QUEUE_STATUS_CHANNEL_NAME)
+        member1 = guild.get_member(entry.user_id)
+        member2 = guild.get_member(other.user_id)
+        if status_channel:
+            mentions = " ".join(m.mention for m in (member1, member2) if m)
+            await status_channel.send(f"{mentions} ⚙️ This match was abandoned during the ban phase. No LP changes.")
+        return
+
+    entry.ability = view1.result_ability
+    other.ability = view2.result_ability
+
+    await create_match_channel(guild, entry, other, chosen_set, set_note, view1.result_ban, view2.result_ban)
+
+
 async def find_match(guild: discord.Guild, entry: QueueEntry):
     while entry.user_id in active_queues:
-        seconds_waiting = (datetime.utcnow() - entry.joined_at).total_seconds()
-
         allowed_regions = get_allowed_regions(entry)
+        allowed_set_types = get_allowed_set_types(entry)
 
         for other_id, other in list(active_queues.items()):
             if other_id == entry.user_id:
                 continue
             if other.region not in allowed_regions:
                 continue
-            if seconds_waiting < 30 and other.set_type != entry.set_type:
+            if other.set_type not in allowed_set_types:
                 continue
 
             match_range = max(
@@ -754,18 +1028,19 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
                 chosen_set = entry.set_type
                 set_note = f"Set Type: {chosen_set}"
             else:
-                chosen_set = random.choice([entry.set_type, other.set_type])
-                set_note = f"Set Type: {chosen_set} *(decided by coinflip)*"
+                chosen_set = min(entry.set_type, other.set_type, key=lambda s: SET_TYPE_VALUE[s])
+                set_note = f"Set Type: {chosen_set} *(lower of {entry.set_type} vs {other.set_type})*"
 
             active_queues.pop(entry.user_id, None)
             active_queues.pop(other_id, None)
 
-            await create_match_channel(guild, entry, other, chosen_set, set_note)
+            asyncio.create_task(run_ban_phase_and_create_match(guild, entry, other, chosen_set, set_note))
             return
 
         await asyncio.sleep(10)
 
-async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry, chosen_set: str, set_note: str):
+async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player2: QueueEntry, chosen_set: str,
+                                set_note: str, ban1: str = None, ban2: str = None):
     category = get_match_category(guild)
     rover_role = discord.utils.get(guild.roles, name="RoVer Updater")
 
@@ -786,13 +1061,24 @@ async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player
         overwrites=overwrites
     )
 
+    if player1.region == player2.region:
+        host_region = player1.region
+        host_region_note = f"Host Region: {host_region}"
+    else:
+        host_region = random.choice([player1.region, player2.region])
+        host_region_note = f"Host Region: {host_region} *(decided by coinflip)*"
+
     cursor.execute("""
-        INSERT INTO matches (player1_id, player2_id, channel_id, region, ability, set_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (player1.user_id, player2.user_id, channel.id, player1.region, player1.ability, chosen_set, str(datetime.utcnow())))
+        INSERT INTO matches (player1_id, player2_id, channel_id, region, ability, set_type, player2_ability, player2_region, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (player1.user_id, player2.user_id, channel.id, player1.region, player1.ability, chosen_set,
+          player2.ability, player2.region, str(datetime.utcnow())))
     conn.commit()
 
     match_id = cursor.lastrowid
+
+    record_ability_used(player1.ability)
+    record_ability_used(player2.ability)
 
     active_matches[channel.id] = {
         "player1": player1.user_id,
@@ -803,7 +1089,7 @@ async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player
     record_match_against(player1.user_id, player2.user_id)
     record_match_against(player2.user_id, player1.user_id)
 
-    await send_match_log(guild, player1, player2, chosen_set, set_note, channel, match_id)
+    await send_match_log(guild, player1, player2, chosen_set, set_note, host_region_note, channel, match_id)
 
     div1, lp1 = elo_to_division(player1.elo)
     div2, lp2 = elo_to_division(player2.elo)
@@ -825,6 +1111,12 @@ async def create_match_channel(guild: discord.Guild, player1: QueueEntry, player
     )
 
     embed.add_field(name="Set Type", value=set_note, inline=False)
+    embed.add_field(name="Host Region", value=host_region_note, inline=False)
+    embed.add_field(
+        name="🚫 Bans",
+        value=f"**{member1.display_name}** banned: {ban1 or 'None'}\n**{member2.display_name}** banned: {ban2 or 'None'}",
+        inline=False
+    )
     embed.set_footer(text="OABD Ranked")
 
     await channel.send(content=f"{member1.mention} {member2.mention}", embed=embed)
@@ -872,11 +1164,11 @@ async def resolve_match(interaction, channel_id, winner_id, loser_id):
     winner_ranked = winner[4]
 
     cursor.execute(
-        "SELECT set_type FROM matches WHERE channel_id = ? ORDER BY match_id DESC LIMIT 1",
+        "SELECT player1_id, player2_id, ability, player2_ability, set_type FROM matches WHERE channel_id = ? ORDER BY match_id DESC LIMIT 1",
         (channel_id,)
     )
     match_row = cursor.fetchone()
-    match_set_type = match_row[0] if match_row else None
+    match_set_type = match_row[4] if match_row else None
 
     gain, loss = calculate_lp_change(winner_elo, loser_elo, winner_id, match_set_type)
 
@@ -961,6 +1253,15 @@ async def resolve_match(interaction, channel_id, winner_id, loser_id):
         WHERE channel_id = ?
     """, (winner_id, gain, channel_id))
     conn.commit()
+
+    if match_row:
+        match_player1_id, match_player2_id, match_ability1, match_ability2, _ = match_row
+        winner_ability = match_ability1 if winner_id == match_player1_id else match_ability2
+        loser_ability = match_ability2 if winner_id == match_player1_id else match_ability1
+        if winner_ability:
+            record_ability_result(winner_ability, won=True)
+        if loser_ability:
+            record_ability_result(loser_ability, won=False)
 
     # Re-fetch final elo rather than trusting new_winner_elo/new_loser_elo —
     # those locals don't reflect the placement_elo overwrite above once a
@@ -1055,6 +1356,12 @@ bot.setup_hook = setup_hook
 # list, so it's offered via autocomplete (type-to-search) instead.
 
 ABILITY_VALUES = [a.value for a in Ability]
+ABILITY_VALUES_BY_LOWER = {v.lower(): v for v in ABILITY_VALUES}
+
+def resolve_ability_input(text: str):
+    # Case-insensitive lookup so a modal text field (no autocomplete available
+    # there) still forgives casing on exact-name abilities like "TW:S".
+    return ABILITY_VALUES_BY_LOWER.get(text.strip().lower())
 
 async def ability_autocomplete(interaction: discord.Interaction, current: str):
     current_lower = current.lower()
@@ -1108,7 +1415,8 @@ async def queue(
         ability=ability,
         set_type=set_type.value,
         elo=elo,
-        joined_at=datetime.utcnow()
+        joined_at=datetime.utcnow(),
+        interaction=interaction
     )
     active_queues[user_id] = entry
 
@@ -1118,6 +1426,7 @@ async def queue(
     )
 
     asyncio.create_task(find_match(interaction.guild, entry))
+    asyncio.create_task(maybe_ping_queue_role(interaction.guild, entry))
 
 @bot.tree.command(name="leavequeue", description="Leave the matchmaking queue")
 async def leavequeue(interaction: discord.Interaction):
