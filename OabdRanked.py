@@ -830,60 +830,73 @@ def get_allowed_set_types(entry: QueueEntry) -> list:
 # Runs privately per-player once a match is found and before the match
 # channel exists. Each player may ban one ability from their own pool (which
 # forces a repick if they ban the ability they're currently using), or do
-# nothing, or abandon the match outright. Delivery tries, in order: editing
-# their original /queue response, DMing them, then a public fallback ping in
-# #ranked-general if neither reaches them.
+# nothing, or abandon the match outright. All bans/picks are dropdowns, not
+# typed text, so there's nothing to mistype and no case-sensitivity to worry
+# about. Delivery tries, in order: editing their original /queue response,
+# DMing them, then a public fallback ping in #ranked-general if neither
+# reaches them. Every notification (start, reminder, abandon) is DMed, never
+# posted publicly, so nobody but the two matched players can tell who's
+# queued or who they've been matched against before the match channel exists.
 
-class RepickModal(discord.ui.Modal, title="Pick a New Ability"):
-    new_ability = discord.ui.TextInput(label="Your new ability (you banned your old one)", required=True)
+def chunk_list(items: list, size: int) -> list:
+    return [items[i:i + size] for i in range(0, len(items), size)]
 
-    def __init__(self, state: "BanPickView"):
-        super().__init__()
-        self.state = state
+class AbilitySelect(discord.ui.Select):
+    def __init__(self, abilities: list, row: int):
+        options = [discord.SelectOption(label=a, value=a) for a in abilities]
+        super().__init__(placeholder=f"Ban: {abilities[0]} – {abilities[-1]}", min_values=1, max_values=1,
+                          options=options, row=row)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        resolved = resolve_ability_input(self.new_ability.value)
-        if resolved is None:
-            await interaction.response.send_message(f"'{self.new_ability.value}' isn't a valid ability. Try again.", ephemeral=True)
-            return
-        if resolved == self.state.result_ban:
-            await interaction.response.send_message("You can't pick the ability you just banned.", ephemeral=True)
-            return
+    async def callback(self, interaction: discord.Interaction):
+        view: BanSelectView = self.view
+        chosen = self.values[0]
+        view.result_ban = chosen
+        record_ability_banned(chosen)
 
-        self.state.result_ability = resolved
-        await interaction.response.edit_message(
-            content=f"✅ You banned **{self.state.result_ban}** and will use **{resolved}** for this match.",
-            embed=None, view=None
-        )
-        self.state.stop()
-
-class BanModal(discord.ui.Modal, title="Ban an Ability"):
-    ability_to_ban = discord.ui.TextInput(label="Ability to ban (exact name)", required=True)
-
-    def __init__(self, state: "BanPickView"):
-        super().__init__()
-        self.state = state
-
-    async def on_submit(self, interaction: discord.Interaction):
-        resolved = resolve_ability_input(self.ability_to_ban.value)
-        if resolved is None:
-            await interaction.response.send_message(f"'{self.ability_to_ban.value}' isn't a valid ability. Try again.", ephemeral=True)
-            return
-
-        self.state.result_ban = resolved
-        record_ability_banned(resolved)
-
-        if resolved == self.state.entry.ability:
-            # They banned the ability they're currently set to use -- they need to pick a new one.
-            await interaction.response.send_modal(RepickModal(self.state))
+        if chosen == view.entry.ability:
+            remaining = [a for a in ABILITY_VALUES if a != chosen]
+            repick_view = RepickSelectView(view, remaining)
+            await interaction.response.edit_message(
+                content=f"⚠️ You banned your own ability (**{chosen}**)! Pick a new one below.",
+                embed=None, view=repick_view
+            )
         else:
             await interaction.response.edit_message(
-                content=f"✅ You banned **{resolved}**. Your ability for this match stays **{self.state.entry.ability}**.",
+                content=f"✅ You banned **{chosen}**. Your ability for this match stays **{view.entry.ability}**.",
                 embed=None, view=None
             )
-            self.state.stop()
+            view.stop()
 
-class BanPickView(discord.ui.View):
+class RepickSelect(discord.ui.Select):
+    def __init__(self, abilities: list, row: int):
+        options = [discord.SelectOption(label=a, value=a) for a in abilities]
+        super().__init__(placeholder=f"Pick: {abilities[0]} – {abilities[-1]}", min_values=1, max_values=1,
+                          options=options, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        parent = self.view.parent
+        chosen = self.values[0]
+        parent.result_ability = chosen
+        await interaction.response.edit_message(
+            content=f"✅ You banned **{parent.result_ban}** and will use **{chosen}** for this match.",
+            embed=None, view=None
+        )
+        parent.stop()
+
+class RepickSelectView(discord.ui.View):
+    def __init__(self, parent: "BanSelectView", abilities: list):
+        super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
+        self.parent = parent
+        for i, chunk in enumerate(chunk_list(abilities, 25)):
+            self.add_item(RepickSelect(chunk, row=i))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.parent.entry.user_id:
+            await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
+            return False
+        return True
+
+class BanSelectView(discord.ui.View):
     def __init__(self, entry: QueueEntry):
         super().__init__(timeout=BAN_PHASE_TIMEOUT_MINUTES * 60)
         self.entry = entry
@@ -891,17 +904,16 @@ class BanPickView(discord.ui.View):
         self.result_ability = entry.ability
         self.abandoned = False
 
+        for i, chunk in enumerate(chunk_list(ABILITY_VALUES, 25)):
+            self.add_item(AbilitySelect(chunk, row=i))
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.entry.user_id:
             await interaction.response.send_message("This isn't your ban phase.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Ban an Ability", style=discord.ButtonStyle.danger)
-    async def ban_ability(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BanModal(self))
-
-    @discord.ui.button(label="Don't Ban Anything", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Don't Ban Anything", style=discord.ButtonStyle.secondary, row=3)
     async def no_ban(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.result_ban = None
         await interaction.response.edit_message(
@@ -910,33 +922,32 @@ class BanPickView(discord.ui.View):
         )
         self.stop()
 
-    @discord.ui.button(label="Abandon Match", style=discord.ButtonStyle.grey)
+    @discord.ui.button(label="Abandon Match", style=discord.ButtonStyle.grey, row=3)
     async def abandon(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.abandoned = True
         await interaction.response.edit_message(content="⚠️ You abandoned this match.", embed=None, view=None)
         self.stop()
 
-async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str) -> BanPickView:
-    view = BanPickView(entry)
+async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, opponent_ability: str) -> BanSelectView:
+    view = BanSelectView(entry)
     member = guild.get_member(entry.user_id)
 
     embed = discord.Embed(
         title="⚔️ Match Found — Ban Phase",
         description=(
-            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes to optionally ban one ability from the pool, "
-            f"or do nothing to keep your current pick.\n\n**Your current ability:** {entry.ability}"
+            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes to optionally ban one ability from the dropdowns "
+            f"below, or do nothing to keep your current pick.\n\n**Your current ability:** {entry.ability}"
         ),
         color=discord.Color.orange()
     )
 
     delivered = False
-    delivery_note = None
+    delivered_via_dm = False
 
     if entry.interaction is not None:
         try:
             await entry.interaction.edit_original_response(content=None, embed=embed, view=view)
             delivered = True
-            delivery_note = "your original /queue response"
         except Exception:
             delivered = False
 
@@ -944,14 +955,12 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
         try:
             await member.send(embed=embed, view=view)
             delivered = True
-            delivery_note = "the DM we just sent you"
+            delivered_via_dm = True
         except Exception:
             delivered = False
 
-    status_channel = discord.utils.get(guild.text_channels, name=QUEUE_STATUS_CHANNEL_NAME)
-    general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
-
     if not delivered:
+        general_channel = discord.utils.get(guild.text_channels, name=RANKED_GENERAL_CHANNEL_NAME)
         if general_channel and member:
             await general_channel.send(
                 f"{member.mention} ⚠️ We couldn't reach you to run your ban phase (check that you allow "
@@ -960,18 +969,25 @@ async def run_ban_phase_for_player(guild: discord.Guild, entry: QueueEntry, oppo
         view.stop()
         return view
 
-    if status_channel and member:
-        await status_channel.send(
-            f"{member.mention} ⚔️ Your match's ban phase has started — check {delivery_note}! "
-            f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
-        )
+    # Editing the original /queue response doesn't generate a notification for
+    # them, so send a heads-up DM. Skipped if we already just DMed the ban UI
+    # itself, since that DM is its own notification.
+    if not delivered_via_dm and member is not None:
+        try:
+            await member.send(
+                f"⚔️ Your match's ban phase has started — check your original `/queue` response! "
+                f"You have {BAN_PHASE_TIMEOUT_MINUTES} minutes."
+            )
+        except Exception:
+            pass
 
     async def reminder():
         await asyncio.sleep(max(0, BAN_PHASE_TIMEOUT_MINUTES * 60 - BAN_PHASE_REMINDER_SECONDS_BEFORE_END))
-        if not view.is_finished() and status_channel and member:
-            await status_channel.send(
-                f"{member.mention} ⏰ {BAN_PHASE_REMINDER_SECONDS_BEFORE_END} seconds left in your ban phase!"
-            )
+        if not view.is_finished() and member is not None:
+            try:
+                await member.send(f"⏰ {BAN_PHASE_REMINDER_SECONDS_BEFORE_END} seconds left in your ban phase!")
+            except Exception:
+                pass
 
     reminder_task = asyncio.create_task(reminder())
     await view.wait()
@@ -987,12 +1003,14 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
     )
 
     if view1.abandoned or view2.abandoned:
-        status_channel = discord.utils.get(guild.text_channels, name=QUEUE_STATUS_CHANNEL_NAME)
         member1 = guild.get_member(entry.user_id)
         member2 = guild.get_member(other.user_id)
-        if status_channel:
-            mentions = " ".join(m.mention for m in (member1, member2) if m)
-            await status_channel.send(f"{mentions} ⚙️ This match was abandoned during the ban phase. No LP changes.")
+        for member in (member1, member2):
+            if member:
+                try:
+                    await member.send("⚙️ Your match was abandoned during the ban phase. No LP changes.")
+                except Exception:
+                    pass
         return
 
     entry.ability = view1.result_ability
@@ -1356,12 +1374,6 @@ bot.setup_hook = setup_hook
 # list, so it's offered via autocomplete (type-to-search) instead.
 
 ABILITY_VALUES = [a.value for a in Ability]
-ABILITY_VALUES_BY_LOWER = {v.lower(): v for v in ABILITY_VALUES}
-
-def resolve_ability_input(text: str):
-    # Case-insensitive lookup so a modal text field (no autocomplete available
-    # there) still forgives casing on exact-name abilities like "TW:S".
-    return ABILITY_VALUES_BY_LOWER.get(text.strip().lower())
 
 async def ability_autocomplete(interaction: discord.Interaction, current: str):
     current_lower = current.lower()
