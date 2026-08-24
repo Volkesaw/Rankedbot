@@ -570,6 +570,7 @@ active_queues = {}
 active_matches = {}
 help_cooldowns = {}
 last_queue_ping_at = None
+pending_match_players = set()  # popped from active_queues but not yet in active_matches (mid ban-phase)
 
 class QueueEntry:
     def __init__(self, user_id, region, ability, set_type, elo, joined_at, interaction=None):
@@ -1115,6 +1116,8 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
     if view1.abandoned or view2.abandoned:
         await notify_both_abandoned(guild, entry, other)
         await delete_warning_messages(warning_messages)
+        pending_match_players.discard(entry.user_id)
+        pending_match_players.discard(other.user_id)
         return
 
     # Bans affect both players, not just whoever banned it -- check each
@@ -1142,6 +1145,8 @@ async def run_ban_phase_and_create_match(guild: discord.Guild, entry: QueueEntry
 
     await create_match_channel(guild, entry, other, chosen_set, set_note, view1.result_ban, view2.result_ban)
     await delete_warning_messages(warning_messages)
+    pending_match_players.discard(entry.user_id)
+    pending_match_players.discard(other.user_id)
 
 
 async def find_match(guild: discord.Guild, entry: QueueEntry):
@@ -1176,6 +1181,8 @@ async def find_match(guild: discord.Guild, entry: QueueEntry):
 
             active_queues.pop(entry.user_id, None)
             active_queues.pop(other_id, None)
+            pending_match_players.add(entry.user_id)
+            pending_match_players.add(other_id)
 
             asyncio.create_task(run_ban_phase_and_create_match(guild, entry, other, chosen_set, set_note))
             return
@@ -1282,6 +1289,15 @@ async def match_timeout_watcher(guild: discord.Guild, channel_id: int, match_id:
     if channel:
         member1 = guild.get_member(match["player1"])
         member2 = guild.get_member(match["player2"])
+
+        try:
+            if member1:
+                await channel.set_permissions(member1, send_messages=False)
+            if member2:
+                await channel.set_permissions(member2, send_messages=False)
+        except Exception:
+            pass
+
         mentions = " ".join(m.mention for m in (member1, member2) if m)
         rover_mention = f" {rover_role.mention}" if rover_role else ""
         await channel.send(
@@ -1423,6 +1439,15 @@ async def resolve_match(interaction, channel_id, winner_id, loser_id):
     winner_member = interaction.guild.get_member(winner_id)
     loser_member = interaction.guild.get_member(loser_id)
 
+    # Lock the channel down once the result is in -- only RoVer Updater keeps send access.
+    try:
+        if winner_member:
+            await interaction.channel.set_permissions(winner_member, send_messages=False)
+        if loser_member:
+            await interaction.channel.set_permissions(loser_member, send_messages=False)
+    except Exception:
+        pass
+
     embed = discord.Embed(title="✅ Match Result Confirmed", color=discord.Color.green())
     embed.add_field(name="🏆 Winner", value=f"{winner_member.mention}\n+{gain} LP → {winner_rank_str}", inline=True)
     embed.add_field(name="❌ Loser", value=f"{loser_member.mention}\n-{loss} LP → {loser_rank_str}", inline=True)
@@ -1534,6 +1559,12 @@ async def queue(
         await interaction.followup.send("You are already in queue. Use `/leavequeue` to leave.", ephemeral=True)
         return
 
+    if user_id in pending_match_players:
+        await interaction.followup.send(
+            "You're currently being matched into a game — please wait for your match channel.", ephemeral=True
+        )
+        return
+
     in_active_match = any(
         user_id in [m["player1"], m["player2"]]
         for m in active_matches.values()
@@ -1591,18 +1622,23 @@ async def queuestatus(interaction: discord.Interaction):
 
     region_counts = {}
     set_counts = {}
-    ability_counts = {}
+    rank_counts = {}
 
     for entry in active_queues.values():
         region_counts[entry.region] = region_counts.get(entry.region, 0) + 1
         set_counts[entry.set_type] = set_counts.get(entry.set_type, 0) + 1
-        ability_counts[entry.ability] = ability_counts.get(entry.ability, 0) + 1
+
+        if is_ex_team(entry.user_id):
+            rank_label = "👑 EX Team"
+        else:
+            rank_label, _ = elo_to_division(entry.elo)
+        rank_counts[rank_label] = rank_counts.get(rank_label, 0) + 1
 
     embed = discord.Embed(title="📊 Queue Status", color=discord.Color.green())
     embed.add_field(name="Players in Queue", value=str(len(active_queues)), inline=False)
     embed.add_field(name="By Region", value="\n".join(f"{r}: {c}" for r, c in region_counts.items()), inline=True)
     embed.add_field(name="By Set Type", value="\n".join(f"{s}: {c}" for s, c in set_counts.items()), inline=True)
-    embed.add_field(name="By Ability", value="\n".join(f"{a}: {c}" for a, c in ability_counts.items()), inline=True)
+    embed.add_field(name="By Rank", value="\n".join(f"{r}: {c}" for r, c in rank_counts.items()), inline=True)
     embed.add_field(name="Active Matches", value=str(len(active_matches)), inline=False)
     embed.set_footer(text="OABD Ranked")
 
@@ -1670,6 +1706,17 @@ async def override(interaction: discord.Interaction, winner: discord.Member = No
 
     if winner is None:
         active_matches.pop(channel_id, None)
+
+        try:
+            member1 = interaction.guild.get_member(match["player1"])
+            member2 = interaction.guild.get_member(match["player2"])
+            if member1:
+                await interaction.channel.set_permissions(member1, send_messages=False)
+            if member2:
+                await interaction.channel.set_permissions(member2, send_messages=False)
+        except Exception:
+            pass
+
         await interaction.response.send_message(
             f"⚙️ Match cancelled by {interaction.user.mention}. No LP changes. This channel will be deleted in 30 seconds."
         )
