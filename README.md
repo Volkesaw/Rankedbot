@@ -4,6 +4,10 @@ A Discord bot that runs a complete competitive ranked ladder for a 2,000-member 
 
 Built in Python with discord.py and SQLite. Deployed on Railway.
 
+<img src="image.png" alt="Forced repick during the ban phase" width="380">
+
+*The ban phase. The ability pool is split across several dropdowns because Discord caps a select menu at 25 options, and the message is ephemeral — only the player it belongs to can see it.*
+
 ## What it does
 
 **Matchmaking.** Players queue with a region, an ability pick, and a preferred set length (Bo1, Bo3, or Bo5). The matchmaker pairs them within an ELO range that widens at higher divisions, where the population is thinner. Region and set-type preferences cascade: if nobody is queued in your region, the search skips straight past it rather than making you wait out a timer.
@@ -22,24 +26,24 @@ Built in Python with discord.py and SQLite. Deployed on Railway.
 
 ## Tech
 
-- **Python** with discord.py — slash commands, UI components, asyncio
-- - **SQLite** — nine tables covering players, matches, stats, cooldowns, seasons, and ability data, with additive migrations that no-op when re-run
-  - - **Railway** — NIXPACKS build with a persistent volume so the database survives redeploys
-   
-    - ## Running it
-   
-    - Install dependencies:
-   
-    -     pip install -r requirements.txt
-   
-    - Create a .env file:
-   
-    -     DISCORD_TOKEN=your_bot_token
-    -     DB_PATH=ranked.db
-   
-    - Start the bot:
-   
-    -     python OabdRanked.py
-   
-    - The bot expects a few named channels and roles in the server — a queue channel, a ranked-logs channel, a ranked-announcements channel, and a match category. These are configurable in the constants block at the top of the file.
-    - 
+**Python** with discord.py — slash commands, UI components, asyncio.
+**SQLite** — nine tables covering players, matches, stats, cooldowns, seasons, and ability data, with additive migrations that no-op when re-run.
+**Railway** — NIXPACKS build with a persistent volume so the database survives redeploys.
+
+## Running it
+
+Install dependencies:
+
+    pip install -r requirements.txt
+
+    Create a .env file:
+
+        DISCORD_TOKEN=your_bot_token
+            DB_PATH=ranked.db
+
+            Start the bot:
+
+                python OabdRanked.py
+
+                The bot expects a few named channels and roles in the server — a queue channel, a ranked-logs channel, a ranked-announcements channel, and a match category. These are configurable in the constants block at the top of the file.
+                
